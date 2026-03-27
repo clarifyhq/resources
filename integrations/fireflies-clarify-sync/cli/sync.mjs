@@ -400,7 +400,14 @@ class ClarifyClient {
    * @returns {object|null} Matching Clarify meeting, or null
    */
   async findMeeting(title, dateIso, participantEmails, calendarId = null) {
+    // Search meetings within 1 day of the transcript to avoid scanning the entire workspace
+    const transcriptDate = new Date(dateIso);
+    const dayBefore = new Date(transcriptDate.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const dayAfter = new Date(transcriptDate.getTime() + 24 * 60 * 60 * 1000).toISOString();
+
     const params = new URLSearchParams({
+      'filter[start][Is on or after]': dayBefore,
+      'filter[start][Is on or before]': dayAfter,
       'page[limit]': '200',
     });
 
