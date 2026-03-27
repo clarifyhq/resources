@@ -1,4 +1,6 @@
-# Clarify Support Repo
+# Clarify Resources
+
+*Lovingly over-engineered by the Dept. of Clarify Imagineering*
 
 ## License Information
 ### Copyright 2026 Clarify, Inc.
