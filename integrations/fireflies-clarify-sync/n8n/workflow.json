@@ -1,0 +1,403 @@
+{
+  "name": "Fireflies → Clarify Transcript Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "notes": "Runs every 6 hours. Adjust interval as needed."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ══════════════════════════════════════════════════════════\n// CONFIGURATION — Edit these values for your workspace\n// ══════════════════════════════════════════════════════════\nconst CONFIG = {\n  // Clarify workspace slug (from your Clarify URL)\n  clarifyWorkspace: 'your-workspace-slug',\n\n  // Clarify API key (from Settings → API Keys)\n  clarifyApiKey: 'YOUR_CLARIFY_API_KEY',\n\n  // How many transcripts to process per run (max 50)\n  batchSize: 50,\n\n  // Optional: override date range (ISO 8601). Leave null to use auto sync state.\n  // Useful for testing or targeting a specific window.\n  startDate: null,  // e.g. '2026-03-01T00:00:00Z'\n  endDate: null,    // e.g. '2026-03-15T00:00:00Z'\n};\n// ══════════════════════════════════════════════════════════\n\n// Load sync state from workflow static data.\n// On first run, lastSyncDate is null — Fireflies returns all transcripts (oldest first).\nconst staticData = $getWorkflowStaticData('global');\nreturn [{\n  json: {\n    ...CONFIG,\n    lastSyncDate: CONFIG.startDate || staticData.lastSyncDate || null,\n    endDate: CONFIG.endDate || null,\n    syncedCount: (staticData.syncedIds || []).length,\n    isFirstRun: !staticData.lastSyncDate\n  }\n}];"
+      },
+      "id": "load-state",
+      "name": "Load Sync State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0],
+      "notes": "Reads lastSyncDate and synced IDs from n8n's workflow static data. First run returns null (no date filter = fetch all history)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.fireflies.ai/graphql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: `query ListTranscripts($limit: Int, $skip: Int, $fromDate: DateTime, $toDate: DateTime) { transcripts(limit: $limit, skip: $skip, fromDate: $fromDate, toDate: $toDate) { id title date dateString duration organizer_email calendar_id participants speakers { id name } meeting_attendees { displayName name email } } }`, variables: { limit: $json.batchSize || 50, skip: 0, fromDate: $json.lastSyncDate || undefined, toDate: $json.endDate || undefined } }) }}",
+        "options": {}
+      },
+      "id": "list-transcripts",
+      "name": "List Fireflies Transcripts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0],
+      "notes": "Fetches up to 50 transcripts from Fireflies. On first run (no lastSyncDate), returns oldest transcripts first — backfill happens naturally over multiple runs.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Fireflies API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get last sync date from workflow static data\nconst staticData = $getWorkflowStaticData('global');\nconst lastSyncDate = staticData.lastSyncDate || null;\nconst syncedIds = new Set(staticData.syncedIds || []);\n\n// Filter out already-synced transcripts\nconst transcripts = $input.first().json.data?.transcripts || [];\nconst newTranscripts = transcripts.filter(t => !syncedIds.has(t.id));\n\nif (newTranscripts.length === 0) {\n  return [{ json: { skip: true, message: 'No new transcripts', count: 0 } }];\n}\n\n// Pass each transcript as a separate item for the loop\nreturn newTranscripts.map(t => ({\n  json: {\n    skip: false,\n    id: t.id,\n    title: t.title,\n    date: t.dateString || (t.date ? new Date(t.date).toISOString() : null),\n    duration: t.duration || 30,\n    organizer_email: t.organizer_email,\n    calendar_id: t.calendar_id,\n    participants: t.participants || [],\n    speakers: t.speakers || [],\n    meeting_attendees: (t.meeting_attendees || []).map(a => ({\n      email: a.email,\n      name: a.displayName || a.name || a.email || 'Unknown'\n    })).filter(a => a.email)\n  }\n}));"
+      },
+      "id": "filter-new",
+      "name": "Filter Already Synced",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0],
+      "notes": "Checks workflow static data for previously synced IDs. Filters them out and formats each transcript as a separate item."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "false"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-has-transcripts",
+      "name": "Has New Transcripts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 0],
+      "notes": "Skips the rest of the workflow if there are no new transcripts to process."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.fireflies.ai/graphql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: `query GetTranscript($id: String!) { transcript(id: $id) { id title date dateString duration organizer_email host_email calendar_id transcript_url speakers { id name } meeting_attendees { displayName name email } sentences { index speaker_name speaker_id text raw_text start_time end_time } summary { overview action_items keywords } } }`, variables: { id: $json.id } }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1100
+            }
+          }
+        }
+      },
+      "id": "get-transcript",
+      "name": "Fetch Full Transcript",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, -60],
+      "notes": "Fetches the full transcript with sentences and attendees. Rate-limited to ~1 req/sec to stay within Fireflies limits.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Fireflies API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Convert Fireflies transcript → Clarify format\n// Fireflies: sentence-level timestamps in SECONDS\n// Clarify: word-level timestamps in seconds, grouped by speaker\n\nconst transcript = $input.first().json.data?.transcript;\nif (!transcript || !transcript.sentences || transcript.sentences.length === 0) {\n  return [{ json: { skip: true, reason: 'No sentences', id: $('Filter Already Synced').item.json.id } }];\n}\n\nconst sentences = transcript.sentences;\nconst speakers = transcript.speakers || [];\n\n// Build speaker name → ID map\nconst speakerIdMap = {};\nspeakers.forEach((s, i) => {\n  speakerIdMap[s.name] = s.id != null ? parseInt(s.id, 10) : i;\n});\nlet nextSpeakerId = speakers.length;\n\n// Group consecutive sentences by speaker, split into words\nconst segments = [];\nlet currentSegment = null;\n\nfor (const sentence of sentences) {\n  const speakerName = sentence.speaker_name || 'Unknown';\n  const text = sentence.text || sentence.raw_text || '';\n  const startSec = sentence.start_time || 0;\n  const endSec = sentence.end_time || startSec;\n\n  if (!currentSegment || currentSegment.speaker !== speakerName) {\n    if (currentSegment && currentSegment.words.length > 0) segments.push(currentSegment);\n    if (!(speakerName in speakerIdMap)) speakerIdMap[speakerName] = nextSpeakerId++;\n    currentSegment = { speaker: speakerName, speaker_id: speakerIdMap[speakerName], language: 'en', words: [] };\n  }\n\n  const words = text.split(/\\s+/).filter(Boolean);\n  if (words.length === 0) continue;\n\n  const durationSec = endSec - startSec;\n  const wordDurationSec = durationSec / words.length;\n\n  for (let i = 0; i < words.length; i++) {\n    currentSegment.words.push({\n      text: words[i],\n      start_timestamp: startSec + i * wordDurationSec,\n      end_timestamp: startSec + (i + 1) * wordDurationSec,\n      language: null,\n      confidence: null\n    });\n  }\n}\nif (currentSegment && currentSegment.words.length > 0) segments.push(currentSegment);\n\n// Build meeting data\nconst sourceItem = $('Filter Already Synced').item.json;\nconst startDate = transcript.dateString || sourceItem.date;\nconst durationMin = transcript.duration || sourceItem.duration || 30;\nconst endDate = new Date(new Date(startDate).getTime() + durationMin * 60 * 1000).toISOString();\n\n// Get attendees with emails\nconst attendees = (transcript.meeting_attendees || [])\n  .filter(a => a.email)\n  .map(a => ({\n    email: a.email.toLowerCase(),\n    name: a.displayName || a.name || a.email || 'Unknown'\n  }));\n\nreturn [{\n  json: {\n    skip: false,\n    firefliesId: transcript.id,\n    calendarId: transcript.calendar_id || null,\n    title: transcript.title || 'Untitled Meeting',\n    start: startDate,\n    end: endDate,\n    attendees: attendees,\n    participants: attendees.map(a => ({\n      email: a.email,\n      name: a.name,\n      phone_number: null,\n      status: 'yes',\n      organizer: false\n    })),\n    transcript: segments,\n    segmentCount: segments.length,\n    sentenceCount: sentences.length\n  }\n}];"
+      },
+      "id": "convert-transcript",
+      "name": "Convert to Clarify Format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, -60],
+      "notes": "Converts Fireflies sentences (speaker-level, seconds) to Clarify transcript format (word-level, seconds). Groups consecutive sentences by speaker."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "skip-check-2",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "false"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-has-sentences",
+      "name": "Has Sentences?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1540, -60],
+      "notes": "Skips transcripts with no sentence content (failed recordings, still processing, etc.)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Find existing meeting in Clarify or create a new one.\n//\n// Matching strategy (tightest first):\n//   1. Calendar ID match (ical_uid) — automatic, no scoring needed\n//   2. Multi-signal scoring within a 30-minute window:\n//      - Time proximity (0-40 pts, 30 min window)\n//      - Title similarity via Jaccard word overlap (0-40 pts)\n//      - Participant email overlap (0-30 pts)\n//      - Minimum 60 pts AND at least 2 signals required\n\nconst prev = $('Convert to Clarify Format').item.json;\nconst workspace = $('Load Sync State').item.json.clarifyWorkspace;\nconst apiKey = $('Load Sync State').item.json.clarifyApiKey;\nconst baseUrl = `https://api.clarify.ai/v1/workspaces/${workspace}`;\n\n// --- Helper: Jaccard word similarity ---\nfunction jaccardSimilarity(title1, title2) {\n  if (!title1 || !title2) return 0;\n  const words1 = new Set(title1.toLowerCase().replace(/[^a-z0-9 ]/g, '').split(/ +/).filter(w => w.length > 2));\n  const words2 = new Set(title2.toLowerCase().replace(/[^a-z0-9 ]/g, '').split(/ +/).filter(w => w.length > 2));\n  if (words1.size === 0 || words2.size === 0) return 0;\n  let intersection = 0;\n  for (const w of words1) { if (words2.has(w)) intersection++; }\n  const union = new Set([...words1, ...words2]).size;\n  return intersection / union;\n}\n\n// --- Step 1: Search Clarify meetings ---\nconst searchData = await this.helpers.httpRequest({\n  method: 'GET',\n  url: `${baseUrl}/objects/meeting/resources?page[limit]=200`,\n  headers: { 'Authorization': `api-key ${apiKey}` },\n  json: true,\n});\nconst candidates = searchData.data || [];\n\n// --- Step 1a: Try calendar ID match first (strongest signal) ---\nif (prev.calendarId) {\n  const calMatch = candidates.find(item =>\n    item.attributes.ical_uid && item.attributes.ical_uid === prev.calendarId\n  );\n  if (calMatch) {\n    return [{ json: { meetingId: calMatch.id, matched: true, matchType: 'calendar_id', matchTitle: calMatch.attributes.title } }];\n  }\n}\n\n// --- Step 2: Score-based matching (30-minute window) ---\nconst targetDate = new Date(prev.start).getTime();\nconst THIRTY_MIN = 30 * 60 * 1000;\nconst participantEmails = prev.attendees.map(a => a.email.toLowerCase());\n\nlet bestMatch = null;\nlet bestScore = 0;\n\nfor (const item of candidates) {\n  const attrs = item.attributes;\n  let score = 0;\n  let signals = 0;\n\n  if (!attrs.start) continue;\n  const meetingDate = new Date(attrs.start).getTime();\n  const timeDiff = Math.abs(meetingDate - targetDate);\n  if (timeDiff > THIRTY_MIN) continue;\n  const timeScore = (1 - timeDiff / THIRTY_MIN) * 40;\n  score += timeScore;\n  if (timeScore > 10) signals++;\n\n  const titleSim = jaccardSimilarity(prev.title, attrs.title);\n  const titleScore = titleSim * 40;\n  score += titleScore;\n  if (titleScore > 10) signals++;\n\n  if (participantEmails.length > 0 && attrs.participants?.items) {\n    const meetingEmails = attrs.participants.items.map(p => p.email?.toLowerCase()).filter(Boolean);\n    const overlap = participantEmails.filter(e => meetingEmails.includes(e)).length;\n    if (overlap > 0) {\n      score += Math.min(overlap * 10, 30);\n      signals++;\n    }\n  }\n\n  if (score > bestScore && score >= 60 && signals >= 2) {\n    bestScore = score;\n    bestMatch = { id: item.id, title: attrs.title, score, signals };\n  }\n}\n\nif (bestMatch) {\n  return [{ json: { meetingId: bestMatch.id, matched: true, matchType: 'scored', matchScore: bestMatch.score, matchSignals: bestMatch.signals, matchTitle: bestMatch.title } }];\n}\n\n// --- Step 3: No match — create new meeting ---\nconst createData = await this.helpers.httpRequest({\n  method: 'POST',\n  url: `${baseUrl}/objects/meeting/records`,\n  headers: { 'Authorization': `api-key ${apiKey}`, 'Content-Type': 'application/json' },\n  body: {\n    data: {\n      type: 'meeting',\n      attributes: {\n        title: prev.title,\n        start: prev.start,\n        end: prev.end,\n        all_day: false,\n        visibility: 'default',\n        event_id: 'adhoc-fireflies-' + prev.firefliesId,\n        participants: { items: prev.participants }\n      }\n    }\n  },\n  json: true,\n});\n\nif (!createData.data?.id) {\n  throw new Error('Failed to create meeting: ' + JSON.stringify(createData));\n}\n\nreturn [{ json: { meetingId: createData.data.id, matched: false, created: true } }];"
+      },
+      "id": "find-or-create-meeting",
+      "name": "Find or Create Meeting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, -120],
+      "notes": "Searches Clarify for an existing meeting by time proximity (40pts), title similarity (40pts), and participant overlap (30pts). Minimum 60 pts + 2 signals to match. Creates a new ad-hoc meeting if no match found."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ 'https://api.clarify.ai/v1/workspaces/' + $('Load Sync State').item.json.clarifyWorkspace + '/meetings/' + $json.meetingId + '/transcript' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ transcript: $('Convert to Clarify Format').item.json.transcript }) }}",
+        "options": {}
+      },
+      "id": "upload-transcript",
+      "name": "Upload Transcript",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1980, -120],
+      "notes": "Uploads the converted transcript to the newly created meeting.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Clarify API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// For each attendee email, search for existing Person, create if missing, collect IDs\nconst attendees = $('Convert to Clarify Format').item.json.attendees || [];\nconst meetingId = $('Find or Create Meeting').item.json.meetingId;\nconst workspace = $('Load Sync State').item.json.clarifyWorkspace;\nconst apiKey = $('Load Sync State').item.json.clarifyApiKey;\n\nif (!meetingId || attendees.length === 0) {\n  return [{ json: { meetingId, personIds: [], linked: 0 } }];\n}\n\nconst hdrs = { 'Authorization': `api-key ${apiKey}`, 'Content-Type': 'application/json' };\nconst baseUrl = `https://api.clarify.ai/v1/workspaces/${workspace}`;\n\nconst personIds = [];\n\nfor (const attendee of attendees) {\n  try {\n    // Search for existing person\n    const searchData = await this.helpers.httpRequest({\n      method: 'GET',\n      url: `${baseUrl}/objects/person/resources?filter[email_addresses][Contains]=${encodeURIComponent(attendee.email)}&page[limit]=1`,\n      headers: hdrs,\n      json: true,\n    });\n\n    if (searchData.data && searchData.data.length > 0) {\n      personIds.push(searchData.data[0].id);\n      continue;\n    }\n\n    // Create new person\n    const nameParts = (attendee.name || '').trim().split(/\\s+/);\n    const nameObj = {};\n    if (attendee.name) nameObj.full_name = attendee.name;\n    if (nameParts.length >= 2) {\n      nameObj.first_name = nameParts[0];\n      nameObj.last_name = nameParts.slice(1).join(' ');\n    } else if (nameParts.length === 1 && nameParts[0]) {\n      nameObj.first_name = nameParts[0];\n    }\n\n    const createData = await this.helpers.httpRequest({\n      method: 'POST',\n      url: `${baseUrl}/objects/person/records`,\n      headers: hdrs,\n      body: {\n        data: {\n          type: 'person',\n          attributes: {\n            email_addresses: { items: [attendee.email] },\n            ...(Object.keys(nameObj).length > 0 ? { name: nameObj } : {})\n          }\n        }\n      },\n      json: true,\n    });\n    if (createData.data?.id) {\n      personIds.push(createData.data.id);\n    }\n  } catch (e) {\n    // Don't fail the whole sync over one person\n  }\n}\n\n// Link people to meeting\nif (personIds.length > 0) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'PATCH',\n      url: `${baseUrl}/objects/meeting/records/${meetingId}/relationships/people`,\n      headers: hdrs,\n      body: { data: personIds.map(id => ({ type: 'person', id })) },\n      json: true,\n    });\n  } catch (e) {\n    // Best effort\n  }\n}\n\nreturn [{ json: { meetingId, personIds, linked: personIds.length } }];"
+      },
+      "id": "resolve-people",
+      "name": "Resolve & Link People",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, -120],
+      "notes": "For each attendee email: search for existing Person → create if not found → PATCH /relationships/people to link to meeting. This is required because the generic records API doesn't auto-resolve participants."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Update workflow static data with synced IDs and timestamp\nconst staticData = $getWorkflowStaticData('global');\nconst syncedIds = staticData.syncedIds || [];\n\n// Collect all fireflies IDs that were processed in this run\nconst items = $('Filter Already Synced').all();\nconst newIds = items\n  .filter(item => !item.json.skip)\n  .map(item => item.json.id)\n  .filter(Boolean);\n\n// Append new IDs (keep last 10000 to prevent unbounded growth)\nconst allIds = [...syncedIds, ...newIds].slice(-10000);\nstaticData.syncedIds = allIds;\nstaticData.lastSyncDate = new Date().toISOString();\nstaticData.lastRunStats = {\n  date: new Date().toISOString(),\n  processed: newIds.length,\n  total: items.length\n};\n\nreturn [{\n  json: {\n    message: `Sync complete. Processed ${newIds.length} transcripts.`,\n    lastSyncDate: staticData.lastSyncDate,\n    totalSynced: allIds.length\n  }\n}];"
+      },
+      "id": "update-state",
+      "name": "Update Sync State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, -120],
+      "notes": "Saves synced transcript IDs and last sync timestamp to n8n's workflow static data. Caps at 10k IDs to prevent unbounded growth."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mark empty transcripts as synced too so we don't retry them\nconst staticData = $getWorkflowStaticData('global');\nconst syncedIds = staticData.syncedIds || [];\nconst skippedId = $json.id;\nif (skippedId) {\n  syncedIds.push(skippedId);\n  staticData.syncedIds = syncedIds.slice(-10000);\n}\nreturn [{ json: { skipped: true, id: skippedId, reason: $json.reason || 'no sentences' } }];"
+      },
+      "id": "mark-skipped",
+      "name": "Mark Skipped as Synced",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 60],
+      "notes": "Marks transcripts with no content as synced so they aren't retried."
+    },
+    {
+      "parameters": {},
+      "id": "no-op-empty",
+      "name": "Nothing to Sync",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1100, 120],
+      "notes": "No new transcripts — workflow ends here."
+    }
+  ],
+  "connections": {
+    "Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Load Sync State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Sync State": {
+      "main": [
+        [
+          {
+            "node": "List Fireflies Transcripts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Fireflies Transcripts": {
+      "main": [
+        [
+          {
+            "node": "Filter Already Synced",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Already Synced": {
+      "main": [
+        [
+          {
+            "node": "Has New Transcripts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has New Transcripts?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Full Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing to Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Full Transcript": {
+      "main": [
+        [
+          {
+            "node": "Convert to Clarify Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to Clarify Format": {
+      "main": [
+        [
+          {
+            "node": "Has Sentences?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Sentences?": {
+      "main": [
+        [
+          {
+            "node": "Find or Create Meeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Skipped as Synced",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find or Create Meeting": {
+      "main": [
+        [
+          {
+            "node": "Upload Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Transcript": {
+      "main": [
+        [
+          {
+            "node": "Resolve & Link People",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve & Link People": {
+      "main": [
+        [
+          {
+            "node": "Update Sync State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "Fireflies",
+      "id": "fireflies-tag"
+    },
+    {
+      "name": "Clarify",
+      "id": "clarify-tag"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
