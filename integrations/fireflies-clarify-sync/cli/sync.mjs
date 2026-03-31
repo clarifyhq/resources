@@ -21,7 +21,7 @@
  * See README.md for full documentation.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -46,7 +46,12 @@ function loadConfig() {
       const eqIndex = trimmed.indexOf('=');
       if (eqIndex === -1) continue;
       const key = trimmed.slice(0, eqIndex).trim();
-      const value = trimmed.slice(eqIndex + 1).trim();
+      let value = trimmed.slice(eqIndex + 1).trim();
+      // Strip surrounding quotes (common copy-paste mistake)
+      if ((value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
       // Don't override existing env vars
       if (!process.env[key]) {
         process.env[key] = value;
@@ -241,6 +246,15 @@ class FirefliesClient {
       await sleep(100);
     }
 
+    // Warn if we hit the pagination ceiling — data may be truncated
+    if (skip > 5000) {
+      console.warn(
+        `WARNING: Reached Fireflies pagination limit (5000 records). ` +
+        `${all.length} transcripts fetched, but there may be more. ` +
+        `Use startDate/endDate to sync in smaller date ranges.`
+      );
+    }
+
     return all;
   }
 
@@ -400,8 +414,12 @@ class ClarifyClient {
    * @returns {object|null} Matching Clarify meeting, or null
    */
   async findMeeting(title, dateIso, participantEmails, calendarId = null) {
+    // If no date, we can't do a meaningful search
+    if (!dateIso) return null;
+
     // Search meetings within 1 day of the transcript to avoid scanning the entire workspace
     const transcriptDate = new Date(dateIso);
+    if (isNaN(transcriptDate.getTime())) return null;
     const dayBefore = new Date(transcriptDate.getTime() - 24 * 60 * 60 * 1000).toISOString();
     const dayAfter = new Date(transcriptDate.getTime() + 24 * 60 * 60 * 1000).toISOString();
 
@@ -776,7 +794,7 @@ function convertTranscript(sentences, speakers = []) {
       currentSegment = {
         speaker: speakerName,
         speaker_id: speakerIdMap[speakerName],
-        language: 'en',
+        language: null, // Fireflies doesn't reliably provide per-sentence language
         words: [],
       };
     }
@@ -920,7 +938,11 @@ function saveState(state) {
     // Convert Set to Array for JSON serialization, cap at 10k to prevent unbounded growth
     syncedIds: [...state.syncedIds].slice(-10000),
   };
-  writeFileSync(STATE_FILE, JSON.stringify(serializable, null, 2) + '\n');
+  // Atomic write: write to temp file then rename, so a mid-write crash
+  // doesn't corrupt the state file and cause duplicate syncs.
+  const tmpFile = STATE_FILE + '.tmp';
+  writeFileSync(tmpFile, JSON.stringify(serializable, null, 2) + '\n');
+  renameSync(tmpFile, STATE_FILE);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -951,8 +973,8 @@ async function sync({ backfill = false, dryRun = false } = {}) {
   const clarify = new ClarifyClient(config.clarifyWorkspace, config.clarifyApiKey);
   const state = loadState();
 
-  // Cache for email → personId lookups (avoids duplicate API calls across transcripts)
-  const personCache = new Map();
+  // Cache for email → personId lookups (persists across runs via state file)
+  const personCache = new Map(Object.entries(state.personCache || {}));
 
   // Determine date range
   let fromDate;
@@ -1149,6 +1171,8 @@ async function sync({ backfill = false, dryRun = false } = {}) {
   state.stats.totalSkipped += skipped;
   state.stats.totalErrors += errors;
   state.stats.lastRunDate = new Date().toISOString();
+  // Persist person cache (email → personId) to avoid re-resolving on next run
+  state.personCache = Object.fromEntries(personCache);
 
   if (!dryRun) {
     saveState(state);
