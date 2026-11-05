@@ -11,6 +11,19 @@ Both handle transcript conversion, meeting matching, contact resolution, and sta
 
 ---
 
+### Settings worth knowing
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CREATE_CONTACTS` | `true` | Create a contact for attendees not yet in Clarify. `false` = link existing contacts only. |
+| `TRANSCRIPT_LANGUAGE` | `en` | Language code stored on each transcript segment (Clarify requires one). |
+| `INTERNAL_DOMAINS` | — | Your company's email domains, so internal attendees are recognized. |
+
+Use an **admin** Fireflies API key to export the whole team's recordings. The CLI is safe to stop and re-run:
+it records what it has copied in `.sync-state.json`.
+
+---
+
 ## How It Works
 
 ### Data Flow

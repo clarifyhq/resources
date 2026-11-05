@@ -25,6 +25,10 @@ import { readFileSync, writeFileSync, renameSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
+// Language code sent on every transcript segment (Clarify rejects null).
+// Read lazily: .env is loaded in loadConfig(), after module evaluation.
+const transcriptLanguage = () => process.env.TRANSCRIPT_LANGUAGE || 'en';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,6 +68,8 @@ function loadConfig() {
     clarifyWorkspace: process.env.CLARIFY_WORKSPACE,
     clarifyApiKey: process.env.CLARIFY_API_KEY,
     syncWindowDays: parseInt(process.env.SYNC_WINDOW_DAYS || '7', 10),
+    // Create a Clarify contact for attendees who don't exist yet (default true). Set CREATE_CONTACTS=false to only link existing contacts.
+    createContacts: (process.env.CREATE_CONTACTS || 'true').toLowerCase() !== 'false',
     internalDomains: (process.env.INTERNAL_DOMAINS || '')
       .split(',')
       .map(d => d.trim().toLowerCase())
@@ -794,7 +800,9 @@ function convertTranscript(sentences, speakers = []) {
       currentSegment = {
         speaker: speakerName,
         speaker_id: speakerIdMap[speakerName],
-        language: null, // Fireflies doesn't reliably provide per-sentence language
+        // Clarify requires a language string (null → 422 "Expected string, received null", verified 2026-11-05).
+        // Fireflies doesn't reliably provide per-sentence language, so use the TRANSCRIPT_LANGUAGE setting (default 'en').
+        language: transcriptLanguage(),
         words: [],
       };
     }
@@ -817,7 +825,7 @@ function convertTranscript(sentences, speakers = []) {
         // Both Fireflies and Clarify use seconds (float)
         start_timestamp: wordStartSec,
         end_timestamp: wordEndSec,
-        language: null,
+        language: transcriptLanguage(),
         confidence: null,
       });
     }
@@ -1130,7 +1138,7 @@ async function sync({ backfill = false, dryRun = false } = {}) {
         const personIds = await clarify.resolvePersonIds(
           attendeesWithEmails,
           personCache,
-          { createMissing: true, internalDomains: config.internalDomains }
+          { createMissing: config.createContacts, internalDomains: config.internalDomains }
         );
 
         if (personIds.length > 0) {

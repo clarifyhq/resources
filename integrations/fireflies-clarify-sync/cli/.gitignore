@@ -1,0 +1,3 @@
+# Secrets and local state: never commit these
+.env
+.sync-state.json
